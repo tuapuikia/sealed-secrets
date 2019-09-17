@@ -7,6 +7,7 @@ import (
 	"io"
 	mathrand "math/rand"
 	"reflect"
+	"strings"
 	"testing"
 
 	fuzz "github.com/google/gofuzz"
@@ -28,6 +29,55 @@ var _ runtime.Object = &SealedSecret{}
 var _ metav1.ObjectMetaAccessor = &SealedSecret{}
 var _ runtime.Object = &SealedSecretList{}
 var _ metav1.ListMetaAccessor = &SealedSecretList{}
+
+func TestSealingScope(t *testing.T) {
+	testCases := []struct {
+		scope SealingScope
+		name  string
+	}{
+		{StrictScope, "strict"},
+		{NamespaceWideScope, "namespace-wide"},
+		{ClusterWideScope, "cluster-wide"},
+	}
+
+	for _, tc := range testCases {
+		if got, want := tc.scope.String(), tc.name; got != want {
+			t.Errorf("got: %q, want: %q", got, want)
+		}
+
+		var s SealingScope
+		s.Set(tc.name)
+		if got, want := s, tc.scope; got != want {
+			t.Errorf("got: %d, want: %d", got, want)
+		}
+	}
+
+	var s SealingScope
+	s.Set("")
+	if got, want := s, StrictScope; got != want {
+		t.Errorf("got: %d, want: %d", got, want)
+	}
+}
+
+func TestEncryptionLabel(t *testing.T) {
+	const (
+		ns   = "myns"
+		name = "myname"
+	)
+	testCases := []struct {
+		scope SealingScope
+		label string
+	}{
+		{StrictScope, "myns/myname"},
+		{NamespaceWideScope, "myns"},
+		{ClusterWideScope, ""},
+	}
+	for _, tc := range testCases {
+		if got, want := string(EncryptionLabel(ns, name, tc.scope)), tc.label; got != want {
+			t.Errorf("got: %q, want: %q", got, want)
+		}
+	}
+}
 
 func TestLabel(t *testing.T) {
 	s := v1.Secret{
@@ -436,6 +486,13 @@ func TestSealMetadataPreservation(t *testing.T) {
 				Name:        "myname",
 				Namespace:   "myns",
 				Annotations: map[string]string{tc.key: "test value"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: "foo/v1",
+						Kind:       "Foo",
+						Name:       "foo",
+					},
+				},
 			},
 			Data: map[string][]byte{
 				"foo": []byte("bar"),
@@ -451,10 +508,24 @@ func TestSealMetadataPreservation(t *testing.T) {
 		if want := tc.preserved; got != want {
 			t.Errorf("key %q: exists: %v, expected to exist: %v", tc.key, got, want)
 		}
+
+		if got, want := len(ssecret.Spec.Template.OwnerReferences), 0; got != want {
+			t.Errorf("got: %d, want: %d", got, want)
+		}
 	}
 }
 
 func TestUnsealingV1Format(t *testing.T) {
+	testUnsealingV1Format(t, true)
+	testUnsealingV1Format(t, false)
+}
+
+func testUnsealingV1Format(t *testing.T, acceptDeprecated bool) {
+	defer func(saved bool) {
+		AcceptDeprecatedV1Data = saved
+	}(AcceptDeprecatedV1Data)
+	AcceptDeprecatedV1Data = acceptDeprecated
+
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
 
@@ -491,11 +562,17 @@ func TestUnsealingV1Format(t *testing.T) {
 		t.Fatalf("cannot compute fingerprint: %v", err)
 	}
 	secret2, err := ssecret.Unseal(codecs, map[string]*rsa.PrivateKey{fp: key})
-	if err != nil {
-		t.Fatalf("Unseal returned error: %v", err)
-	}
+	if acceptDeprecated {
+		if err != nil {
+			t.Fatalf("Unseal returned error: %v", err)
+		}
 
-	if !reflect.DeepEqual(secret.Data, secret2.Data) {
-		t.Errorf("Unsealed secret != original secret: %v != %v", secret, secret2)
+		if !reflect.DeepEqual(secret.Data, secret2.Data) {
+			t.Errorf("Unsealed secret != original secret: %v != %v", secret, secret2)
+		}
+	} else {
+		if needle := "deprecated"; err == nil || !strings.Contains(err.Error(), needle) {
+			t.Fatalf("Expecting error: %v to contain %q", err, needle)
+		}
 	}
 }

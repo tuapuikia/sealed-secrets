@@ -23,9 +23,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/bitnami-labs/flagenv"
+	"github.com/bitnami-labs/pflagenv"
 	ssv1alpha1 "github.com/bitnami-labs/sealed-secrets/pkg/apis/sealed-secrets/v1alpha1"
 	sealedsecrets "github.com/bitnami-labs/sealed-secrets/pkg/client/clientset/versioned"
 	ssinformers "github.com/bitnami-labs/sealed-secrets/pkg/client/informers/externalversions"
+)
+
+const (
+	flagEnvPrefix = "SEALED_SECRETS"
 )
 
 var (
@@ -34,7 +40,10 @@ var (
 	validFor        = flag.Duration("key-ttl", 10*365*24*time.Hour, "Duration that certificate is valid for.")
 	myCN            = flag.String("my-cn", "", "CN to use in generated certificate.")
 	printVersion    = flag.Bool("version", false, "Print version information and exit")
-	keyRotatePeriod = flag.Duration("rotate-period", 0, "New key generation period (automatic rotation disabled if 0)")
+	keyRotatePeriod = flag.Duration("rotate-period", 30*24*time.Hour, "New key generation period (automatic rotation disabled if 0)")
+	acceptV1Data    = flag.Bool("accept-deprecated-v1-data", false, "Accept deprecated V1 data field")
+
+	oldGCBehavior = flag.Bool("old-gc-behaviour", false, "Revert to old GC behavior where the controller deletes secrets instead of delegating that to k8s itself.")
 
 	// VERSION set from Makefile
 	VERSION = "UNKNOWN"
@@ -44,6 +53,9 @@ var (
 )
 
 func init() {
+	flagenv.SetFlagsFromEnv(flagEnvPrefix, goflag.CommandLine)
+	pflagenv.SetFlagsFromEnv(flagEnvPrefix, flag.CommandLine)
+
 	// Standard goflags (glog in particular)
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	if f := flag.CommandLine.Lookup("logtostderr"); f != nil {
@@ -192,6 +204,7 @@ func main2() error {
 
 	ssinformer := ssinformers.NewSharedInformerFactory(ssclientset, 0)
 	controller := NewController(clientset, ssclientset, ssinformer, keyRegistry)
+	controller.oldGCBehavior = *oldGCBehavior
 
 	stop := make(chan struct{})
 	defer close(stop)
@@ -218,6 +231,8 @@ func main2() error {
 func main() {
 	flag.Parse()
 	goflag.CommandLine.Parse([]string{})
+
+	ssv1alpha1.AcceptDeprecatedV1Data = *acceptV1Data
 
 	if *printVersion {
 		fmt.Printf("controller version: %s\n", VERSION)

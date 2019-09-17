@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	goflag "flag"
@@ -12,6 +15,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/bitnami-labs/sealed-secrets/pkg/crypto"
 	flag "github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,11 +46,16 @@ var (
 	certFile       = flag.String("cert", "", "Certificate / public key to use for encryption. Overrides --controller-*")
 	controllerNs   = flag.String("controller-namespace", metav1.NamespaceSystem, "Namespace of sealed-secrets controller.")
 	controllerName = flag.String("controller-name", "sealed-secrets-controller", "Name of sealed-secrets controller.")
-	outputFormat   = flag.String("format", "json", "Output format for sealed secret. Either json or yaml")
-	rotate         = flag.Bool("rotate", false, "Re-encrypt the given sealed secret to use the latest cluster key.")
+	outputFormat   = flag.StringP("format","o", "json", "Output format for sealed secret. Either json or yaml")
 	dumpCert       = flag.Bool("fetch-cert", false, "Write certificate to stdout. Useful for later use with --cert")
 	printVersion   = flag.Bool("version", false, "Print version information and exit")
 	validateSecret = flag.Bool("validate", false, "Validate that the sealed secret can be decrypted")
+	mergeInto      = flag.String("merge-into", "", "Merge items from secret into an existing sealed secret file, updating the file in-place instead of writing to stdout.")
+	raw            = flag.Bool("raw", false, "Encrypt a raw value passed via the --from-* flags instead of the whole secret object")
+	secretName     = flag.String("name", "", "Name of the sealed secret (required with --raw)")
+	fromFile       = flag.StringSlice("from-file", nil, "(only with --raw) Secret items can be sourced from files. Pro-tip: you can use /dev/stdin to read pipe input. This flag tries to follow the same syntax as in kubectl")
+	sealingScope   ssv1alpha1.SealingScope
+	reEncrypt      bool // re-encrypt command
 
 	// VERSION set from Makefile
 	VERSION = "UNKNOWN"
@@ -55,6 +64,11 @@ var (
 )
 
 func init() {
+	flag.Var(&sealingScope, "scope", "Set the scope of the sealed secret: strict, namespace-wide, cluster-wide. Mandatory for --raw, otherwise the 'sealedsecrets.bitnami.com/cluster-wide' and 'sealedsecrets.bitnami.com/namespace-wide' annotations on the input secret can be used to select the scope.")
+	flag.BoolVar(&reEncrypt, "rotate", false, "")
+	flag.BoolVar(&reEncrypt, "re-encrypt", false, "Re-encrypt the given sealed secret to use the latest cluster key.")
+	flag.CommandLine.MarkDeprecated("rotate", "please use --re-encrypt instead")
+
 	flagenv.SetFlagsFromEnv(flagEnvPrefix, goflag.CommandLine)
 
 	// The "usual" clientcmd/kubectl flags
@@ -128,7 +142,7 @@ func prettyEncoder(codecs runtimeserializer.CodecFactory, mediaType string, gv r
 func openCertFile(certFile string) (io.ReadCloser, error) {
 	f, err := os.Open(certFile)
 	if err != nil {
-		return nil, fmt.Errorf("Error reading %s: %v", certFile, err)
+		return nil, err
 	}
 	return f, nil
 }
@@ -139,14 +153,14 @@ func openCertHTTP(c corev1.CoreV1Interface, namespace, name string) (io.ReadClos
 		ProxyGet("http", name, "", "/v1/cert.pem", nil).
 		Stream()
 	if err != nil {
-		return nil, fmt.Errorf("Error fetching certificate: %v", err)
+		return nil, fmt.Errorf("cannot fetch certificate: %v", err)
 	}
 	return f, nil
 }
 
-func openCert() (io.ReadCloser, error) {
-	if *certFile != "" {
-		return openCertFile(*certFile)
+func openCert(certFile string) (io.ReadCloser, error) {
+	if certFile != "" {
+		return openCertFile(certFile)
 	}
 
 	conf, err := clientConfig.ClientConfig()
@@ -233,15 +247,15 @@ func validateSealedSecret(in io.Reader, namespace, name string) error {
 	res := req.Do()
 	if err := res.Error(); err != nil {
 		if status, ok := err.(*k8serrors.StatusError); ok && status.Status().Code == http.StatusConflict {
-			return fmt.Errorf("Unable to decrypt sealed secret")
+			return fmt.Errorf("unable to decrypt sealed secret")
 		}
-		return fmt.Errorf("Error occurred while validating sealed secret")
+		return fmt.Errorf("cannot validate sealed secret: %v", err)
 	}
 
 	return nil
 }
 
-func rotateSealedSecret(in io.Reader, out io.Writer, codecs runtimeserializer.CodecFactory, namespace, name string) error {
+func reEncryptSealedSecret(in io.Reader, out io.Writer, codecs runtimeserializer.CodecFactory, namespace, name string) error {
 	conf, err := clientConfig.ClientConfig()
 	if err != nil {
 		return err
@@ -267,9 +281,9 @@ func rotateSealedSecret(in io.Reader, out io.Writer, codecs runtimeserializer.Co
 	res := req.Do()
 	if err := res.Error(); err != nil {
 		if status, ok := err.(*k8serrors.StatusError); ok && status.Status().Code == http.StatusConflict {
-			return fmt.Errorf("Unable to rotate secret")
+			return fmt.Errorf("unable to rotate secret")
 		}
-		return fmt.Errorf("Error occurred while rotating secret")
+		return fmt.Errorf("cannot re-encrypt secret: %v", err)
 	}
 	body, err := res.Raw()
 	if err != nil {
@@ -311,49 +325,152 @@ func sealedSecretOutput(out io.Writer, codecs runtimeserializer.CodecFactory, ss
 	return nil
 }
 
-func main() {
-	flag.Parse()
-	goflag.CommandLine.Parse([]string{})
+func decodeSealedSecret(codecs runtimeserializer.CodecFactory, b []byte) (*ssv1alpha1.SealedSecret, error) {
+	var ss ssv1alpha1.SealedSecret
+	if err := runtime.DecodeInto(codecs.UniversalDecoder(), b, &ss); err != nil {
+		return nil, err
+	}
+	return &ss, nil
+}
 
-	if *printVersion {
-		fmt.Printf("kubeseal version: %s\n", VERSION)
-		return
+func sealMergingInto(in io.Reader, filename string, codecs runtimeserializer.CodecFactory, pubKey *rsa.PublicKey) error {
+	var buf bytes.Buffer
+	if err := seal(in, &buf, codecs, pubKey); err != nil {
+		return err
 	}
 
-	if *validateSecret {
-		err := validateSealedSecret(os.Stdin, *controllerNs, *controllerName)
-		if err != nil {
-			panic(err.Error())
-		}
-		return
-	}
-
-	if *rotate {
-		if err := rotateSealedSecret(os.Stdin, os.Stdout, scheme.Codecs, *controllerNs, *controllerName); err != nil {
-			panic(err.Error())
-		}
-		return
-	}
-
-	f, err := openCert()
+	update, err := decodeSealedSecret(codecs, buf.Bytes())
 	if err != nil {
-		panic(err.Error())
+		return err
+	}
+
+	b, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	orig, err := decodeSealedSecret(codecs, b)
+	if err != nil {
+		return err
+	}
+
+	// merge encrypted data and metadata
+	for k, v := range update.Spec.EncryptedData {
+		orig.Spec.EncryptedData[k] = v
+	}
+	for k, v := range update.Spec.Template.Annotations {
+		orig.Spec.Template.Annotations[k] = v
+	}
+	for k, v := range update.Spec.Template.Labels {
+		orig.Spec.Template.Labels[k] = v
+	}
+
+	// updated sealed secret file in-place avoiding clobbering the file upon rendering errors.
+	var out bytes.Buffer
+	if err := sealedSecretOutput(&out, codecs, orig); err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(filename, out.Bytes(), 0)
+}
+
+func encryptSecretItem(w io.Writer, secretName, ns string, data []byte, scope ssv1alpha1.SealingScope, pubKey *rsa.PublicKey) error {
+	// TODO(mkm): refactor cluster-wide/namespace-wide to an actual enum so we can have a simple flag
+	// to refer to the scope mode that is not a tuple of booleans.
+	label := ssv1alpha1.EncryptionLabel(ns, secretName, scope)
+	out, err := crypto.HybridEncrypt(rand.Reader, pubKey, data, label)
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(w, base64.StdEncoding.EncodeToString(out))
+	return nil
+}
+
+// parseFromFile parses a value of the kubectl --from-file flag, which can optionally include an item name
+// preceding the first equals sign.
+func parseFromFile(s string) (string, string) {
+	c := strings.SplitN(s, "=", 2)
+	if len(c) == 1 {
+		return "", c[0]
+	}
+	return c[0], c[1]
+}
+
+func run(w io.Writer, secretName, controllerNs, controllerName, certFile string, printVersion, validateSecret, reEncrypt, dumpCert, raw bool, fromFile []string, mergeInto string) error {
+	if len(fromFile) != 0 && !raw {
+		return fmt.Errorf("--from-file requires --raw")
+	}
+
+	if printVersion {
+		fmt.Fprintf(w, "kubeseal version: %s\n", VERSION)
+		return nil
+	}
+
+	if validateSecret {
+		return validateSealedSecret(os.Stdin, controllerNs, controllerName)
+	}
+
+	if reEncrypt {
+		return reEncryptSealedSecret(os.Stdin, os.Stdout, scheme.Codecs, controllerNs, controllerName)
+	}
+
+	f, err := openCert(certFile)
+	if err != nil {
+		return err
 	}
 	defer f.Close()
 
-	if *dumpCert {
-		if _, err := io.Copy(os.Stdout, f); err != nil {
-			panic(err.Error())
-		}
-		return
+	if dumpCert {
+		_, err := io.Copy(os.Stdout, f)
+		return err
 	}
 
 	pubKey, err := parseKey(f)
 	if err != nil {
-		panic(err.Error())
+		return err
 	}
 
-	if err := seal(os.Stdin, os.Stdout, scheme.Codecs, pubKey); err != nil {
-		panic(err.Error())
+	if mergeInto != "" {
+		return sealMergingInto(os.Stdin, mergeInto, scheme.Codecs, pubKey)
+	}
+
+	if raw {
+		ns, _, err := clientConfig.Namespace()
+		if err != nil {
+			return err
+		}
+		if ns == "" {
+			return fmt.Errorf("must provide the --namespace flag with --raw")
+		}
+		if secretName == "" {
+			return fmt.Errorf("must provide the --name flag with --raw")
+		}
+
+		if len(fromFile) == 0 {
+			return fmt.Errorf("must provide the --from-file flag with --raw")
+		}
+		if len(fromFile) > 1 {
+			return fmt.Errorf("must provide only one --from-file when encrypting a single item with --raw")
+		}
+
+		_, filename := parseFromFile(fromFile[0])
+		data, err := ioutil.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+
+		return encryptSecretItem(w, secretName, ns, data, sealingScope, pubKey)
+	}
+
+	return seal(os.Stdin, os.Stdout, scheme.Codecs, pubKey)
+}
+
+func main() {
+	flag.Parse()
+	goflag.CommandLine.Parse([]string{})
+
+	if err := run(os.Stdout, *secretName, *controllerNs, *controllerName, *certFile, *printVersion, *validateSecret, reEncrypt, *dumpCert, *raw, *fromFile, *mergeInto); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 }
